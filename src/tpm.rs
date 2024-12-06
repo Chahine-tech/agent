@@ -10,6 +10,18 @@ use windows::Win32::Security::Cryptography::{
 };
 use windows::Win32::Foundation::NTSTATUS;
 use rand_core::OsRng as CoreOsRng;
+use tss_esapi::Context;
+use std::convert::TryInto;
+use tss_esapi::{
+    structures::{Auth, KeyedHashScheme, PublicBuilder, RsaScheme, SymmetricDefinitionObject},
+    interface_types::{
+        algorithm::HashingAlgorithm,
+        key_bits::RsaKeyBits,
+        session_handles::AuthSession,
+    },
+};
+
+use tss_esapi::context::TctiNameConf;
 
 #[derive(Debug, Clone, Copy)]
 pub enum KeyType {
@@ -52,8 +64,25 @@ impl WindowsTPMProvider {
     }
 
     fn check_tpm_status(&self) -> Result<(), Box<dyn Error>> {
-        // Implémentez ici une vérification du statut du TPM
-        Ok(())
+        let mut context = Context::new(TctiNameConf::Device(None))?;
+        
+        // Vérifiez si le TPM est activé et prêt
+        let (capabilities, _) = context.get_capability(
+            tss_esapi::interface_types::capability::CapabilityType::TPMProperties,
+            tss_esapi::constants::tss::TPM2_PT_MANUFACTURER as u32,
+            1
+        )?;
+        
+        if let tss_esapi::structures::CapabilityData::TPMProperties(props) = capabilities {
+            if !props.is_empty() {
+                info!("TPM est activé et prêt");
+                Ok(())
+            } else {
+                Err("TPM n'est pas activé ou pas prêt".into())
+            }
+        } else {
+            Err("Impossible de récupérer les propriétés du TPM".into())
+        }
     }
 }
 
@@ -73,9 +102,57 @@ impl TPMProvider for WindowsTPMProvider {
         }
     }
 
-    fn sign(&self, _private_key: &[u8], _data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-        info!("Performing signature operation");
-        Ok(_data.to_vec()) //Simple mock signature
+    fn sign(&self, private_key: &[u8], data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut context = Context::new(TctiNameConf::Device(None))?;
+        
+        // Créez une clé RSA dans le TPM
+        let key_auth = Auth::from_bytes(private_key)?;
+        let public = PublicBuilder::new()
+            .with_public_algorithm(tss_esapi::interface_types::algorithm::PublicAlgorithm::Rsa)
+            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+            .with_object_attributes(
+                tss_esapi::attributes::ObjectAttributesBuilder::new()
+                    .with_user_with_auth(true)
+                    .with_sign_encrypt(true)
+                    .with_sensitive_data_origin(true)
+                    .build()
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?,
+            )
+            .with_rsa_parameters(
+                tss_esapi::structures::PublicRsaParametersBuilder::new()
+                    .with_scheme(RsaScheme::create(
+                        tss_esapi::interface_types::algorithm::RsaSchemeAlgorithm::RsaSsa,
+                        Some(HashingAlgorithm::Sha256),
+                    ))
+                    .with_key_bits(RsaKeyBits::Rsa2048)
+                    .with_is_signing_key(true)
+                    .with_is_decryption_key(false)
+                    .build()
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)?,
+            )
+            .with_rsa_unique_identifier(Vec::new())
+            .build()
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+
+        let key_handle = context.create_primary(
+            tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
+            public,
+            Some(key_auth.clone()),
+            None,
+            None,
+            None,
+        )?;
+
+        // Signez les données
+        let signature = context.sign(
+            key_handle,
+            data,
+            tss_esapi::structures::SignatureScheme::RsaSsa(HashingAlgorithm::Sha256),
+            None,
+        )?;
+
+        // Convertissez la signature en Vec<u8>
+        Ok(signature.try_into()?)
     }
 }
 
@@ -99,7 +176,6 @@ fn generate_ed25519_key() -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
     info!("Successfully generated Ed25519 key");
     Ok((private_key_bytes, public_key_bytes))
 }
-
 
 pub struct MockTPMProvider;
 
